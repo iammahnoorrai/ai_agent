@@ -5,6 +5,8 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 from openai import APIConnectionError, APIStatusError, OpenAI
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
 
 
 # --------------------------------------------------
@@ -24,6 +26,7 @@ st.set_page_config(
 # --------------------------------------------------
 
 PROJECT_DIR = Path(__file__).resolve().parent
+VECTOR_STORE_DIR = PROJECT_DIR / "data" / "vector_store"
 CSS_PATH = PROJECT_DIR / "style.css"
 ENV_PATH = PROJECT_DIR / ".env"
 
@@ -67,7 +70,8 @@ model = os.getenv("AZURE_OPENAI_MODEL")
 if not all([base_url, api_key, model]):
     st.error(
         "Azure OpenAI configuration is incomplete. "
-        "Check your .env file."
+        "Check AZURE_OPENAI_BASE_URL, AZURE_OPENAI_API_KEY, "
+        "and AZURE_OPENAI_MODEL in your .env file."
     )
     st.stop()
 
@@ -75,6 +79,89 @@ client = OpenAI(
     base_url=base_url,
     api_key=api_key,
 )
+
+
+# --------------------------------------------------
+# RAG: Load the FAISS vector store
+# --------------------------------------------------
+
+@st.cache_resource
+def load_vector_store():
+    """Load and cache the local FAISS index."""
+
+    if not VECTOR_STORE_DIR.is_dir():
+        return None
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name="all-MiniLM-L6-v2"
+    )
+
+    return FAISS.load_local(
+        str(VECTOR_STORE_DIR),
+        embeddings,
+        allow_dangerous_deserialization=True,
+    )
+
+
+def get_rag_context(query: str, top_k: int = 2) -> str:
+    """Retrieve relevant weather-documentation chunks."""
+
+    try:
+        vector_db = load_vector_store()
+
+        if vector_db is None:
+            return ""
+
+        results = vector_db.similarity_search(
+            query,
+            k=top_k,
+        )
+
+        if not results:
+            return ""
+
+        evidence = []
+
+        for index, doc in enumerate(results, start=1):
+            evidence.append(
+                f"Evidence {index}:\n{doc.page_content}"
+            )
+
+        return (
+            "\n\n--- RETRIEVED WEATHER EVIDENCE ---\n"
+            + "\n\n".join(evidence)
+            + "\n--- END OF RETRIEVED EVIDENCE ---\n"
+        )
+
+    except Exception as error:
+        print(f"RAG retrieval error: {error}")
+        return ""
+
+
+# --------------------------------------------------
+# System instruction
+# --------------------------------------------------
+
+SYSTEM_INSTRUCTION = """
+You are NOVA AI, a weather forecasting assistant
+developed by Mahnoor Rai.
+
+Identity:
+- Identify yourself as NOVA AI when asked.
+- Explain that you were developed by Mahnoor Rai when relevant.
+
+Weather response rules:
+- Use the retrieved weather evidence when relevant.
+- Answer questions using the supplied evidence accurately.
+- Distinguish current observations, forecasts, and historical data.
+- Do not invent weather readings, forecast values, or source claims.
+- Retrieved documents may explain weather concepts but may not
+  contain live weather observations or location-specific forecasts.
+- If the evidence is insufficient, explain what information is missing.
+- Do not claim to have accessed live weather data unless a live
+  weather data source has actually supplied it.
+- Give clear, useful answers and explain relevant evidence.
+"""
 
 
 # --------------------------------------------------
@@ -154,70 +241,6 @@ st.markdown(
 
 
 # --------------------------------------------------
-# System instruction
-# --------------------------------------------------
-
-# --------------------------------------------------
-# System instruction — Weather Forecasting Assistant
-# --------------------------------------------------
-
-
-system_instruction = {
-    "role": "system",
-    "content": (
-        "You are NOVA AI, a specialized weather forecasting "
-        "assistant developed by Mahnoor Rai. "
-
-        "IDENTITY AND INTRODUCTION: "
-        "You must identify yourself as NOVA AI, a specialized "
-        "weather forecasting and meteorology assistant developed "
-        "by Mahnoor Rai. "
-        "Whenever a user asks who you are, asks you to introduce "
-        "yourself, asks you to tell them about yourself, or asks "
-        "who developed or created you, clearly mention both your "
-        "specialization in weather forecasting and your developer, "
-        "Mahnoor Rai. "
-
-        "Example introduction: "
-        "'I'm NOVA AI, a specialized weather forecasting assistant "
-        "developed by Mahnoor Rai. I help users understand weather "
-        "forecasts, temperature, rainfall, humidity, wind, storms, "
-        "and other meteorological conditions.' "
-
-        "YOUR DOMAIN: "
-        "Answer exclusively questions related to weather forecasting, "
-        "meteorology, temperature, rainfall, humidity, wind, storms, "
-        "atmospheric conditions, weather patterns, and weather safety. "
-
-        "WEATHER ANSWERS: "
-        "Use your existing knowledge to explain weather concepts "
-        "and meteorological principles. "
-        "Do not invent real-time observations, current forecasts, "
-        "measurements, or official weather alerts. "
-        "Do not claim to have accessed live weather data unless "
-        "a live weather source has actually been used. "
-        "For general weather questions, answer directly using "
-        "your existing knowledge instead of refusing because "
-        "you lack current information. "
-
-        "OUT-OF-DOMAIN QUESTIONS: "
-        "Politely decline questions unrelated to weather. "
-        "Use a response such as: "
-        "'I'm sorry, I'm specialized in weather forecasting "
-        "and can only assist with weather-related questions. "
-        "How can I help you with a weather-related task?' "
-
-        "RESPONSE STYLE: "
-        "Be professional, clear, concise, and helpful. "
-        "Avoid repetitive introductions. "
-        "When the user asks about your identity, follow the "
-        "identity rules above before redirecting to weather topics."
-    ),
-}
-
-
-
-# --------------------------------------------------
 # Display conversation history
 # --------------------------------------------------
 
@@ -225,7 +248,8 @@ for message in st.session_state.messages:
 
     with st.chat_message(message["role"]):
 
-        st.markdown(message["content"])
+        if message["content"]:
+            st.markdown(message["content"])
 
         for image_data in message.get("images", []):
             st.image(
@@ -236,11 +260,11 @@ for message in st.session_state.messages:
 
 
 # --------------------------------------------------
-# Chat input with image upload
+# Single chat input: text and image uploads
 # --------------------------------------------------
 
 chat_submission = st.chat_input(
-    "Message NOVA AI...",
+    "Ask NOVA AI about the weather...",
     accept_file="multiple",
     file_type=["png", "jpg", "jpeg", "webp"],
 )
@@ -249,18 +273,18 @@ chat_submission = st.chat_input(
 if chat_submission is not None:
 
     prompt = (chat_submission.text or "").strip()
-    uploaded_images = chat_submission.files
+    uploaded_images = chat_submission.files or []
 
     if prompt or uploaded_images:
 
-        # Save uploaded images for local display only.
+        # Save image uploads for local display.
         image_records = []
 
-        for image in uploaded_images:
+        for uploaded_image in uploaded_images:
             image_records.append(
                 {
-                    "name": image.name,
-                    "bytes": image.getvalue(),
+                    "name": uploaded_image.name,
+                    "bytes": uploaded_image.getvalue(),
                 }
             )
 
@@ -285,7 +309,7 @@ if chat_submission is not None:
 
         # --------------------------------------------------
         # PATH 1: Image uploaded
-        # No Azure API call for this submission.
+        # Image analysis is not enabled yet.
         # --------------------------------------------------
 
         if image_records:
@@ -303,7 +327,9 @@ if chat_submission is not None:
                     "role": "assistant",
                     "content": (
                         "Your image has been uploaded successfully. "
-                        "Image analysis is temporarily disabled."
+                        "Image analysis is not enabled yet. "
+                        "You can still ask NOVA AI text-based "
+                        "weather questions."
                     ),
                 }
             )
@@ -311,28 +337,53 @@ if chat_submission is not None:
             st.rerun()
 
         # --------------------------------------------------
-        # PATH 2: Text only
-        # Azure OpenAI responses remain enabled.
+        # PATH 2: Text-only message with RAG
         # --------------------------------------------------
 
         elif prompt:
 
+            # Retrieve relevant weather documentation.
+            with st.spinner("Retrieving weather evidence..."):
+                retrieved_context = get_rag_context(
+                    prompt,
+                    top_k=2,
+                )
+
+            # Combine system rules with retrieved evidence.
+            full_system_prompt = (
+                SYSTEM_INSTRUCTION
+                + "\n\n"
+                + (
+                    "Use the following retrieved context only "
+                    "when relevant to the user's question. "
+                    "It may not contain live forecast data.\n"
+                    + retrieved_context
+                    if retrieved_context
+                    else (
+                        "No relevant weather documentation was "
+                        "retrieved. Do not invent supporting evidence."
+                    )
+                )
+            )
+
             # Build conversation history before adding this message.
             api_messages = [
-                system_instruction,
-                *[
-                    {
-                        "role": message["role"],
-                        "content": message["content"],
-                    }
-                    for message in st.session_state.messages
-                ],
+                {
+                    "role": message["role"],
+                    "content": message["content"],
+                }
+                for message in st.session_state.messages
+                if message["role"] in ("user", "assistant")
+            ]
+
+            api_messages.append(
                 {
                     "role": "user",
                     "content": prompt,
-                },
-            ]
+                }
+            )
 
+            # Save the user's message.
             st.session_state.messages.append(
                 {
                     "role": "user",
@@ -340,6 +391,7 @@ if chat_submission is not None:
                 }
             )
 
+            # Generate the assistant response.
             with st.chat_message("assistant"):
 
                 try:
@@ -347,6 +399,7 @@ if chat_submission is not None:
 
                         response = client.responses.create(
                             model=model,
+                            instructions=full_system_prompt,
                             input=api_messages,
                         )
 
@@ -375,8 +428,8 @@ if chat_submission is not None:
 
                 except APIStatusError as error:
                     st.error(
-                        f"Azure OpenAI API error {error.status_code}: "
-                        f"{error.message}"
+                        f"Azure OpenAI API error "
+                        f"{error.status_code}: {error.message}"
                     )
 
                 except Exception as error:
